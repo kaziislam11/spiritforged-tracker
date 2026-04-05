@@ -1,23 +1,16 @@
 """
 Microcenter Riftbound: Spiritforged Stock Checker
 ==================================================
-Monitors Microcenter for Spiritforged Booster Display Box and Sleeved Boosters.
-Sends you a text (via email-to-SMS gateway) when stock is detected.
+Runs via GitHub Actions every 10 minutes.
+Only sends a text when stock is detected at Microcenter Flushing.
 
-SETUP (local):
-  1. pip install requests beautifulsoup4 python-dotenv
-  2. Fill in your .env file (see .env.example)
-  3. python mc_riftbound_checker.py
-
-SETUP (Railway):
-  1. Push this folder to GitHub (the .env file will NOT be pushed — it's in .gitignore)
-  2. Connect repo to Railway
-  3. In Railway dashboard > Variables, add GMAIL_ADDRESS and GMAIL_APP_PASS
-  4. Deploy — it runs forever automatically
+Secrets in GitHub repo Settings > Secrets > Actions:
+  - GMAIL_ADDRESS
+  - GMAIL_APP_PASS
 """
 
 import os
-import time
+import json
 import smtplib
 import requests
 from bs4 import BeautifulSoup
@@ -25,28 +18,21 @@ from email.mime.text import MIMEText
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Load .env file if it exists (local dev). On Railway, env vars are injected automatically.
 load_dotenv()
 
 # ============================================================
 #  CONFIG
 # ============================================================
 
-STORE_ID       = "145"                  # Microcenter Flushing, NY (71-43 Kissena Blvd)
-YOUR_PHONE_SMS = "9296057131@vtext.com" # Verizon SMS gateway
-CHECK_INTERVAL = 300                    # Seconds between checks (5 min)
-
-# Loaded from .env locally, or Railway Variables in prod — never hardcoded
+STORE_ID       = "145"                   # Microcenter Flushing, NY
+YOUR_PHONE_SMS = "9296057131@vtext.com"  # Verizon SMS gateway
 GMAIL_ADDRESS  = os.environ.get("GMAIL_ADDRESS")
 GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS")
-
-# ============================================================
-#  PRODUCTS TO WATCH
-# ============================================================
+STATE_FILE     = "stock_state.json"
 
 PRODUCTS = [
     {
-        "name": "Spiritforged Booster Display Box",
+        "name": "Spiritforged Booster Box",
         "url":  "https://www.microcenter.com/product/707000/riot-games-riftbound-league-of-legends-tcg-spirit-forged-booster-display-box",
         "sku":  "707000",
     },
@@ -56,10 +42,6 @@ PRODUCTS = [
         "sku":  "706995",
     },
 ]
-
-# ============================================================
-#  HEADERS — mimics a real browser visit
-# ============================================================
 
 HEADERS = {
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -72,54 +54,50 @@ HEADERS = {
 }
 
 # ============================================================
-#  CORE FUNCTIONS
+#  FUNCTIONS
 # ============================================================
 
-def send_text(subject: str, body: str):
-    """Send an SMS via email-to-SMS gateway using Gmail."""
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}")
+
+
+def send_text(subject, body):
     if not GMAIL_ADDRESS or not GMAIL_APP_PASS:
-        print("  [SMS SKIPPED] GMAIL_ADDRESS or GMAIL_APP_PASS not set in environment.")
+        log("[SMS SKIPPED] Missing credentials")
         return
     try:
         msg = MIMEText(body)
         msg["Subject"] = subject
         msg["From"]    = GMAIL_ADDRESS
         msg["To"]      = YOUR_PHONE_SMS
-
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(GMAIL_ADDRESS, GMAIL_APP_PASS)
             server.sendmail(GMAIL_ADDRESS, YOUR_PHONE_SMS, msg.as_string())
-
-        print(f"  [SMS sent] {subject}")
+        log(f"[SMS SENT] {subject}")
+    except smtplib.SMTPAuthenticationError:
+        log("[SMS FAILED] Bad app password")
     except Exception as e:
-        print(f"  [SMS FAILED] {e}")
+        log(f"[SMS FAILED] {type(e).__name__}: {e}")
 
 
-def check_stock(product: dict, session: requests.Session):
-    """
-    Returns True if in stock, False if out of stock, None on error.
-    Sets the storeSelected cookie so we get the right store's data.
-    """
+def check_stock(product, session):
     try:
         session.cookies.set("storeSelected", STORE_ID, domain=".microcenter.com")
         resp = session.get(product["url"], headers=HEADERS, timeout=15)
         resp.raise_for_status()
-
         soup = BeautifulSoup(resp.text, "html.parser")
         page_text = soup.get_text(" ", strip=True).lower()
 
-        # Check explicit out-of-stock signals first
         if "out of stock" in page_text or "sold out" in page_text:
             qty_tag = soup.find("span", {"id": "pnlInventory"})
             if qty_tag and "in stock" in qty_tag.get_text().lower():
                 return True
             return False
 
-        # Check for positive in-stock signals
         if "in stock" in page_text or "add to cart" in page_text:
             return True
 
-        # Fallback — look for the inventory quantity element
         qty_el = soup.find(id="pnlInventory")
         if qty_el:
             qty_text = qty_el.get_text(strip=True).lower()
@@ -129,112 +107,65 @@ def check_stock(product: dict, session: requests.Session):
         return False
 
     except requests.exceptions.RequestException as e:
-        print(f"  [Network error for {product['name']}] {e}")
+        log(f"[Network error] {product['name']}: {e}")
         return None
 
 
-def log(msg: str):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+def load_state():
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        log(f"[State save failed] {e}")
 
 
 # ============================================================
-#  STARTUP VALIDATION
-# ============================================================
-
-def validate_config():
-    errors = []
-    if not GMAIL_ADDRESS:
-        errors.append("GMAIL_ADDRESS is not set in your .env file")
-    if not GMAIL_APP_PASS:
-        errors.append("GMAIL_APP_PASS is not set in your .env file")
-    if errors:
-        print("\n[ERROR] Missing configuration:")
-        for e in errors:
-            print(f"  - {e}")
-        print("\nCreate a .env file with:")
-        print("  GMAIL_ADDRESS=your_email@gmail.com")
-        print("  GMAIL_APP_PASS=xxxx xxxx xxxx xxxx")
-        print("\nOr set them as environment variables in Railway.\n")
-        exit(1)
-
-
-# ============================================================
-#  MAIN LOOP
+#  MAIN
 # ============================================================
 
 def main():
-    validate_config()
+    log("Riftbound check — Microcenter Flushing")
 
-    print("=" * 55)
-    print("  Microcenter Riftbound: Spiritforged Stock Checker")
-    print("=" * 55)
-    print(f"  Store         : Flushing, NY (ID: {STORE_ID})")
-    print(f"  Alert SMS     : {YOUR_PHONE_SMS}")
-    print(f"  Gmail         : {GMAIL_ADDRESS}")
-    print(f"  Check every   : {CHECK_INTERVAL}s ({CHECK_INTERVAL // 60} min)")
-    print(f"  Watching      : {len(PRODUCTS)} product(s)")
-    print("  Press Ctrl+C to stop anytime.")
-    print("=" * 55)
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASS:
+        log("[ERROR] Missing GMAIL_ADDRESS or GMAIL_APP_PASS in secrets")
+        exit(1)
 
-    prev_state = {p["sku"]: None for p in PRODUCTS}
-    session = requests.Session()
-    check_count = 0
+    prev_state = load_state()
+    new_state  = {}
+    session    = requests.Session()
 
-    # Startup confirmation text
-    send_text(
-        "Riftbound Checker Started",
-        f"Monitoring {len(PRODUCTS)} Spiritforged product(s) at Microcenter Flushing. "
-        f"Checking every {CHECK_INTERVAL // 60} min. You'll get a text when stock appears."
-    )
+    for product in PRODUCTS:
+        in_stock = check_stock(product, session)
+        sku      = product["sku"]
 
-    while True:
-        check_count += 1
-        log(f"Check #{check_count} — scanning {len(PRODUCTS)} product(s)...")
+        if in_stock is None:
+            log(f"? {product['name']} — check failed")
+            new_state[sku] = prev_state.get(sku, False)
+            continue
 
-        for product in PRODUCTS:
-            in_stock = check_stock(product, session)
+        log(f"{'IN STOCK' if in_stock else 'out of stock'} — {product['name']}")
 
-            if in_stock is None:
-                log(f"  ? {product['name']} — error, skipping")
-                continue
+        was_in_stock = prev_state.get(sku, False)
 
-            status_str = "IN STOCK ✓" if in_stock else "out of stock"
-            log(f"  {'✓' if in_stock else '✗'} {product['name']} — {status_str}")
+        if in_stock and not was_in_stock:
+            send_text(
+                f"IN STOCK: {product['name']}",
+                f"{product['name']} back at MC Flushing!\n{product['url']}"
+            )
 
-            # Alert on change to in-stock
-            if in_stock and prev_state[product["sku"]] is False:
-                send_text(
-                    f"IN STOCK: {product['name']}",
-                    f"{product['name']} is NOW IN STOCK at Microcenter Flushing!\n"
-                    f"Move fast:\n{product['url']}"
-                )
-            elif not in_stock and prev_state[product["sku"]] is True:
-                log(f"  [Note] {product['name']} just went out of stock.")
+        new_state[sku] = in_stock
 
-            # First run — alert if already in stock
-            elif in_stock and prev_state[product["sku"]] is None:
-                send_text(
-                    f"ALREADY IN STOCK: {product['name']}",
-                    f"{product['name']} is IN STOCK right now at Microcenter Flushing!\n"
-                    f"{product['url']}"
-                )
-
-            prev_state[product["sku"]] = in_stock
-            time.sleep(3)
-
-        log(f"  Done. Next check in {CHECK_INTERVAL}s...")
-        print()
-
-        try:
-            time.sleep(CHECK_INTERVAL)
-        except KeyboardInterrupt:
-            print("\n[Stopped] Goodbye!")
-            break
+    save_state(new_state)
+    log("Done.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n[Stopped] Goodbye!")
+    main()
